@@ -118,7 +118,33 @@ const proxy = (req, res) => {
   out.setTimeout(controlTimeoutMs, () =>
     out.destroy(new Error('upstream timeout')),
   );
+  // Where a request stood when it failed, for the log: which phase went
+  // silent, whether the socket was a kept-alive one from an earlier request,
+  // and which address it talked to.
+  let phase = 'connect';
+  let socketKind = 'new';
+  let remote = 'unknown';
+  out.on('socket', (socket) => {
+    if (out.reusedSocket) socketKind = 'reused';
+    const connected = () => {
+      remote = socket.remoteAddress ?? 'unknown';
+      if (phase === 'connect') phase = 'request';
+    };
+    if (socket.connecting) socket.once('connect', connected);
+    else connected();
+  });
+  out.on('finish', () => {
+    if (phase !== 'body') phase = 'headers';
+  });
+  const where = () =>
+    `(phase: ${phase}, socket: ${socketKind}, remote: ${remote}, at: ${new Date().toISOString()})`;
+  const why = (error, silence) =>
+    error?.message === 'upstream timeout'
+      ? `${silence} for ${controlTimeoutMs} ms`
+      : reasonOf(error);
+
   out.on('response', (upstreamRes) => {
+    phase = 'body';
     res.writeHead(
       upstreamRes.statusCode ?? 502,
       forwardable(upstreamRes.headers),
@@ -131,18 +157,14 @@ const proxy = (req, res) => {
       // The response to Nx ends short: Nx gets an error for this request
       // instead of waiting until the job times out.
       if (!res.writableFinished && !res.destroyed) {
-        const reason =
-          error?.message === 'upstream timeout'
-            ? `no data for ${controlTimeoutMs} ms`
-            : reasonOf(error);
         process.stderr.write(
-          `ci-cache gateway: ${req.method} ${target.pathname} stalled: ${reason}\n`,
+          `ci-cache gateway: ${req.method} ${target.pathname} stalled: ${why(error, 'no data')} ${where()}\n`,
         );
       }
       return void res.destroy();
     }
     process.stderr.write(
-      `ci-cache gateway: ${req.method} ${target.pathname} failed: ${reasonOf(error)}\n`,
+      `ci-cache gateway: ${req.method} ${target.pathname} failed: ${why(error, 'no answer')} ${where()}\n`,
     );
     void answer(req, res, failureStatus(req.method));
   });
