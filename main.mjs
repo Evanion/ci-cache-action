@@ -13,6 +13,9 @@ const result = spawnSync('bash', [join(actionDir, 'setup.sh')], {
   env: {
     ...process.env,
     GITHUB_ACTION_PATH: actionDir,
+    // The gateway runs on this node: the runner always has it, while a
+    // \`node\` on PATH may not exist before a setup-node step.
+    CI_CACHE_NODE: process.execPath,
     INPUT_TOOL: input('tool'),
     INPUT_SERVER: input('server'),
     INPUT_READ_TOKEN: input('read-token'),

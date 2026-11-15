@@ -5,9 +5,14 @@
 # token from the server's GitHub OIDC exchange when the job has an OIDC token
 # and the server says the run may write, else the read token.
 # A pull_request run's write token is confined to that PR's namespace (pr-<n>).
-# In write mode it starts gateway.mjs on 127.0.0.1 and points Nx at it, so an
-# artifact over Cloudflare's 100 MB body limit goes straight to R2.
+# It starts gateway.mjs on 127.0.0.1 and points Nx at it. The gateway turns a
+# request the server stops answering into a miss, so Nx never waits on it
+# until the job times out, and in write mode sends an artifact over
+# Cloudflare's 100 MB body limit straight to R2. A server that does not answer
+# at setup, or a gateway that does not start, turns the remote cache off for
+# the run: the job builds everything itself.
 # Optional input (env): INPUT_LARGE_UPLOAD_THRESHOLD, bytes, default 95 MiB.
+# CI_CACHE_NODE (env, set by main.mjs): the node binary that runs the gateway.
 set -euo pipefail
 
 TOKEN_RE='^nxc_[A-Za-z0-9_-]{43}$'
@@ -63,6 +68,9 @@ fi
 
 token="$read_token"
 mode="read"
+# Set when a request to the server got no answer: curl failed to connect or
+# hit --max-time.
+unreachable=""
 
 exchange() {
   local id_json jwt audience resp code body err
@@ -88,6 +96,7 @@ exchange() {
       -H 'Content-Type: application/json' --data @- \
       "$server/v1/oidc/github")" || {
     echo "OIDC: exchange request failed"
+    unreachable=1
     return 1
   }
   code="${resp##*$'\n'}"
@@ -129,6 +138,7 @@ eligible() {
     curl -s --max-time 15 -w '\n%{http_code}' -H @- \
       "$server/v1/oidc/github/eligibility?event=$(uri "${GITHUB_EVENT_NAME:-}")&ref=$(uri "${GITHUB_REF:-}")&ref_type=$(uri "${GITHUB_REF_TYPE:-}")")" || {
     echo "OIDC: eligibility check failed"
+    unreachable=1
     return 1
   }
   code="${resp##*$'\n'}"
@@ -160,27 +170,43 @@ if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_T
   fi
 fi
 
+# Exports nothing, so Nx runs without a remote cache.
+cache_off() {
+  echo "$1 Remote cache is off for this run."
+  echo "CI cache mode: off"
+  exit 0
+}
+
+if [[ -n "$unreachable" ]]; then
+  cache_off "::warning::The CI cache server $server did not answer within 15 s."
+fi
+
+if [[ ! "$threshold" =~ ^[1-9][0-9]{0,15}$ ]]; then
+  echo "::warning::large-upload-threshold must be a byte count, for example 99614720. Using 99614720."
+  threshold=99614720
+fi
+
 # Starts the gateway in the background and sets gateway_server to its origin.
 # It gets no token: the environment loses the read token and the OIDC request
-# token, and it forwards the Authorization header Nx sends.
+# token, and it forwards the Authorization header Nx sends. In read mode it
+# answers cache writes itself, since the read token may not write.
 start_gateway() {
   local dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
   local port_file="$dir/ci-cache-gateway.port"
   local log="$dir/ci-cache-gateway.log"
   local pid_file="$dir/ci-cache-gateway.pid"
+  local read_only=""
   local pid port i
 
-  if [[ ! "$threshold" =~ ^[1-9][0-9]{0,15}$ ]]; then
-    echo "::warning::large-upload-threshold must be a byte count, for example 99614720. Artifacts over 100 MB will not be cached."
-    return 1
-  fi
+  [[ "$mode" == write* ]] || read_only=1
   rm -f "$port_file"
   CI_CACHE_GATEWAY_UPSTREAM="$server" \
     CI_CACHE_GATEWAY_THRESHOLD="$threshold" \
     CI_CACHE_GATEWAY_PORT_FILE="$port_file" \
+    CI_CACHE_GATEWAY_READ_ONLY="$read_only" \
     nohup env -u INPUT_READ_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
     -u ACTIONS_ID_TOKEN_REQUEST_URL \
-    node "$action_dir/gateway.mjs" </dev/null >"$log" 2>&1 &
+    "${CI_CACHE_NODE:-node}" "$action_dir/gateway.mjs" </dev/null >"$log" 2>&1 &
   pid=$!
   # post.mjs stops the gateway at the end of the job.
   printf '%s' "$pid" >"$pid_file"
@@ -192,28 +218,21 @@ start_gateway() {
   done
   port="$(cat "$port_file" 2>/dev/null || true)"
   if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]]; then
-    echo "::warning::ci-cache gateway did not start (log: $log). Artifacts over 100 MB will not be cached."
-    return 1
+    kill "$pid" 2>/dev/null || true
+    cache_off "::warning::ci-cache gateway did not start (log: $log)."
   fi
   gateway_server="http://127.0.0.1:$port"
 }
 
 gateway_server=""
-large_uploads=""
-if [[ "$mode" == write* ]]; then
-  if start_gateway; then
-    large_uploads="via gateway"
-  else
-    large_uploads="off"
-  fi
-fi
+start_gateway
 
 {
-  echo "NX_SELF_HOSTED_REMOTE_CACHE_SERVER=${gateway_server:-$server}"
+  echo "NX_SELF_HOSTED_REMOTE_CACHE_SERVER=$gateway_server"
   echo "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=$token"
 } >>"$GITHUB_ENV"
 
 echo "CI cache mode: $mode"
-if [[ -n "$large_uploads" ]]; then
-  echo "CI cache large uploads: $large_uploads"
+if [[ "$mode" == write* ]]; then
+  echo "CI cache large uploads: via gateway"
 fi

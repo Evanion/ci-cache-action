@@ -6,7 +6,8 @@
 //
 // Env: CI_CACHE_GATEWAY_UPSTREAM (Worker origin), CI_CACHE_GATEWAY_THRESHOLD
 // (bytes), CI_CACHE_GATEWAY_PORT_FILE (receives the bound port),
-// CI_CACHE_GATEWAY_CONTROL_TIMEOUT_MS (optional, default 30000). It logs to
+// CI_CACHE_GATEWAY_CONTROL_TIMEOUT_MS (optional, default 30000),
+// CI_CACHE_GATEWAY_READ_ONLY ("1" in read mode). It logs to
 // stderr; the action's post step copies the "not cached" lines into the job.
 //
 // Toward Nx a failure of the gateway's own is a 404 (a miss) for a read and a
@@ -24,6 +25,9 @@ const controlTimeoutMs = Number(
   env.CI_CACHE_GATEWAY_CONTROL_TIMEOUT_MS ?? 30000,
 );
 const portFile = env.CI_CACHE_GATEWAY_PORT_FILE;
+// A read token may not write: a cache PUT gets its 403 here, so the body
+// never crosses the network and one over 100 MB never meets Cloudflare's 413.
+const readOnly = env.CI_CACHE_GATEWAY_READ_ONLY === '1';
 
 const HASH_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const CACHE_PUT_RE = /^\/v1\/cache\/([^/?]*)(?:\?.*)?$/;
@@ -106,32 +110,15 @@ const proxy = (req, res) => {
     headers: forwardable(req.headers),
   });
   dropWithClient(res, out);
-  // The connect, and the wait from the end of the request body to the
-  // response headers, each get the control timeout. A response body that is
-  // flowing gets none, however long it takes.
-  let timer;
-  let sent = false;
-  const arm = () => {
-    clearTimeout(timer);
-    timer = setTimeout(
-      () => out.destroy(new Error('upstream timeout')),
-      controlTimeoutMs,
-    );
-  };
-  arm();
-  out.on('socket', (socket) => {
-    const connected = () => {
-      if (!sent) clearTimeout(timer);
-    };
-    if (socket.connecting) socket.once('connect', connected);
-    else connected();
-  });
-  out.on('finish', () => {
-    sent = true;
-    arm();
-  });
+  // The socket gets the control timeout for silence in either direction: the
+  // connect, a request body the Worker stops reading, the wait for response
+  // headers, and a response body that stops flowing. A body that keeps
+  // flowing gets no limit, however long it takes. Without this, a connection
+  // the network drops silently leaves Nx waiting until the job times out.
+  out.setTimeout(controlTimeoutMs, () =>
+    out.destroy(new Error('upstream timeout')),
+  );
   out.on('response', (upstreamRes) => {
-    clearTimeout(timer);
     res.writeHead(
       upstreamRes.statusCode ?? 502,
       forwardable(upstreamRes.headers),
@@ -140,8 +127,20 @@ const proxy = (req, res) => {
     upstreamRes.on('error', () => res.destroy());
   });
   out.on('error', (error) => {
-    clearTimeout(timer);
-    if (res.headersSent || res.destroyed) return void res.destroy();
+    if (res.headersSent || res.destroyed) {
+      // The response to Nx ends short: Nx gets an error for this request
+      // instead of waiting until the job times out.
+      if (!res.writableFinished && !res.destroyed) {
+        const reason =
+          error?.message === 'upstream timeout'
+            ? `no data for ${controlTimeoutMs} ms`
+            : reasonOf(error);
+        process.stderr.write(
+          `ci-cache gateway: ${req.method} ${target.pathname} stalled: ${reason}\n`,
+        );
+      }
+      return void res.destroy();
+    }
     process.stderr.write(
       `ci-cache gateway: ${req.method} ${target.pathname} failed: ${reasonOf(error)}\n`,
     );
@@ -240,6 +239,7 @@ const largePut = async (req, res, hash, size) => {
 const handle = (req, res) => {
   const size = Number(req.headers['content-length']);
   const match = req.method === 'PUT' ? CACHE_PUT_RE.exec(req.url ?? '') : null;
+  if (match && readOnly) return void answer(req, res, 403);
   if (match && Number.isSafeInteger(size) && size > threshold) {
     largePut(req, res, match[1], size).catch((error) => {
       warn(`ci-cache gateway: ${match[1]} not cached: ${reasonOf(error)}`);
