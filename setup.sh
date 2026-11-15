@@ -71,6 +71,21 @@ mode="read"
 # Set when a request to the server got no answer: curl failed to connect or
 # hit --max-time.
 unreachable=""
+# For a request to the server that gets no answer, curl writes how far it got
+# to stderr, which goes to this file: DNS, connect, TLS and first-byte times in
+# seconds from the start (0 for a step it never finished) and the address. The
+# log line then says which step went silent.
+times_file="${RUNNER_TEMP:-/tmp}/ci-cache-curl-times"
+CURL_TIMES='%{stderr}dns %{time_namelookup} s, connect %{time_connect} s, tls %{time_appconnect} s, first byte %{time_starttransfer} s, remote %{remote_ip}'
+
+# Why a request to the server got no answer: curl's exit code (6 DNS, 7
+# connect, 28 timeout, 35 TLS), how far it got, and when.
+no_answer() {
+  local rc="$1" times=""
+  [[ -f "$times_file" ]] && times="$(tr -d '\n' <"$times_file")"
+  [[ "$times" == *"remote " ]] && times+="none"
+  echo "curl exit $rc, ${times:-no timings}, at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
 
 exchange() {
   local id_json jwt audience resp code body err
@@ -92,10 +107,10 @@ exchange() {
   echo "::add-mask::$jwt"
 
   resp="$(JWT="$jwt" jq -n '{token: env.JWT}' |
-    curl -s --max-time 15 -w '\n%{http_code}' -X POST \
+    curl -s --max-time 15 -w "\n%{http_code}$CURL_TIMES" -X POST \
       -H 'Content-Type: application/json' --data @- \
-      "$server/v1/oidc/github")" || {
-    echo "OIDC: exchange request failed"
+      "$server/v1/oidc/github" 2>"$times_file")" || {
+    echo "OIDC: exchange request failed ($(no_answer $?))"
     unreachable=1
     return 1
   }
@@ -135,9 +150,9 @@ eligible() {
   local resp code body answer
   # The read token goes through stdin so it never appears in a process argv.
   resp="$(printf 'Authorization: Bearer %s\n' "$read_token" |
-    curl -s --max-time 15 -w '\n%{http_code}' -H @- \
-      "$server/v1/oidc/github/eligibility?event=$(uri "${GITHUB_EVENT_NAME:-}")&ref=$(uri "${GITHUB_REF:-}")&ref_type=$(uri "${GITHUB_REF_TYPE:-}")")" || {
-    echo "OIDC: eligibility check failed"
+    curl -s --max-time 15 -w "\n%{http_code}$CURL_TIMES" -H @- \
+      "$server/v1/oidc/github/eligibility?event=$(uri "${GITHUB_EVENT_NAME:-}")&ref=$(uri "${GITHUB_REF:-}")&ref_type=$(uri "${GITHUB_REF_TYPE:-}")" 2>"$times_file")" || {
+    echo "OIDC: eligibility check failed ($(no_answer $?))"
     unreachable=1
     return 1
   }
