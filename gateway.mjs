@@ -121,8 +121,9 @@ const answer = async (req, res, status, json) => {
   res.end(body);
 };
 
+// `forbidden` is the code that turns Turbo 2.11's uploads off for the run.
 const READ_ONLY_TURBO = turboError(
-  'read_only',
+  'forbidden',
   "This run's token may not write.",
 );
 
