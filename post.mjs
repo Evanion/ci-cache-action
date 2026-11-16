@@ -1,9 +1,13 @@
 // Post step of the setup action, run at the end of the job. It stops the
 // gateway, copies its "not cached" lines into this step's summary and the
 // job log, and copies its failed and stalled requests into the job log: a
-// background process's own output reaches neither. Node 20 built-ins only.
+// background process's own output reaches neither. With tool turbo it then
+// posts the job's Turborepo run summaries as run reports. Node 20 built-ins
+// only.
 import { appendFileSync, readFileSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
+import { postTurboReports } from './turbo-report.mjs';
 
 const dir = process.env.RUNNER_TEMP ?? '';
 const read = (name) => {
@@ -50,4 +54,16 @@ if (lines.length > 0 && process.env.GITHUB_STEP_SUMMARY) {
       '',
     ].join('\n'),
   );
+}
+
+// The gateway is stopped, so the reports go to the server directly.
+if (
+  (process.env.INPUT_TOOL ?? '').trim() === 'turbo' &&
+  process.env.TURBO_TOKEN
+) {
+  await postTurboReports({
+    env: process.env,
+    cpus: availableParallelism(),
+    marker: join(dir, 'ci-cache-turbo-since'),
+  });
 }

@@ -2,9 +2,12 @@ name: Evanion CI Cache setup
 description: Configures the CI cache for a build tool. Default-branch pushes get a 1-hour write token through GitHub OIDC, same-repo pull requests get one confined to their own PR namespace, everything else gets the read token.
 inputs:
   tool:
-    description: Build tool to configure. Only nx is supported; turbo and generic are reserved and fail the step until they ship.
+    description: Build tool to configure. nx or turbo. generic is reserved and fails the step until it ships.
     required: false
     default: nx
+  team:
+    description: 'Turborepo only: the org slug, exported as TURBO_TEAM. Turbo only uses the remote cache with a team set. Required with tool turbo.'
+    required: false
   server:
     description: Cache server origin, for example vars.CI_CACHE_SERVER.
     required: true

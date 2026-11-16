@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Exports the CI cache env vars for the build tool to $GITHUB_ENV.
-# Run by main.mjs. Inputs (env): INPUT_TOOL, INPUT_SERVER, INPUT_READ_TOKEN.
-# Only tool nx is supported, so the exports are Nx's. Uses a 1-hour write
-# token from the server's GitHub OIDC exchange when the job has an OIDC token
-# and the server says the run may write, else the read token.
+# Run by main.mjs. Inputs (env): INPUT_TOOL, INPUT_SERVER, INPUT_READ_TOKEN,
+# INPUT_TEAM (required for tool turbo). Exports the settings of tool nx or
+# turbo. Uses a 1-hour write token from the server's GitHub OIDC exchange when
+# the job has an OIDC token and the server says the run may write, else the
+# read token.
 # A pull_request run's write token is confined to that PR's namespace (pr-<n>).
-# It starts gateway.mjs on 127.0.0.1 and points Nx at it. The gateway turns a
-# request the server stops answering into a miss, so Nx never waits on it
-# until the job times out, and in write mode sends an artifact over
-# Cloudflare's 100 MB body limit straight to R2. A server that does not answer
-# at setup, or a gateway that does not start, turns the remote cache off for
-# the run: the job builds everything itself.
+# It starts gateway.mjs on 127.0.0.1 and points the build tool at it. The
+# gateway turns a request the server stops answering into a miss, so the tool
+# never waits on it until the job times out, and in write mode sends an
+# artifact over Cloudflare's 100 MB body limit straight to R2. A server that
+# does not answer at setup, or a gateway that does not start, turns the remote
+# cache off for the run: the job builds everything itself.
 # Optional input (env): INPUT_LARGE_UPLOAD_THRESHOLD, bytes, default 95 MiB.
 # CI_CACHE_NODE (env, set by main.mjs): the node binary that runs the gateway.
 set -euo pipefail
@@ -20,23 +21,38 @@ JWT_RE='^[A-Za-z0-9._-]+$'
 NAMESPACE_RE='^pr-[1-9][0-9]{0,9}$'
 SERVER_RE='^(https://[A-Za-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:[0-9]+)?$'
 
-# The tool check runs before anything else, so a reserved or unknown tool fails
-# the step even in a run without a read token.
-tool="${INPUT_TOOL:-}"
-tool="${tool#"${tool%%[![:space:]]*}"}"
-tool="${tool%"${tool##*[![:space:]]}"}"
-case "${tool:-nx}" in
+TEAM_RE='^[a-z0-9][a-z0-9-]{0,62}$'
+
+trim() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"
+  printf '%s' "${v%"${v##*[![:space:]]}"}"
+}
+
+# The tool and team checks run before anything else, so a reserved tool or a
+# missing team fails the step even in a run without a read token.
+tool="$(trim "${INPUT_TOOL:-}")"
+tool="${tool:-nx}"
+team=""
+case "$tool" in
 nx) ;;
 turbo)
-  echo "::error::tool 'turbo' is not supported yet (Evanion/cache#149)" >&2
-  exit 1
+  team="$(trim "${INPUT_TEAM:-}")"
+  if [[ -z "$team" ]]; then
+    echo "::error::team is required for tool turbo (the org slug)" >&2
+    exit 1
+  fi
+  if [[ ! "$team" =~ $TEAM_RE ]]; then
+    echo "::error::team must be the org slug" >&2
+    exit 1
+  fi
   ;;
 generic)
   echo "::error::tool 'generic' is not supported yet (Evanion/cache#159)" >&2
   exit 1
   ;;
 *)
-  echo "::error::tool must be nx" >&2
+  echo "::error::tool must be nx or turbo" >&2
   exit 1
   ;;
 esac
@@ -185,7 +201,7 @@ if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_T
   fi
 fi
 
-# Exports nothing, so Nx runs without a remote cache.
+# Exports nothing, so the build tool runs without a remote cache.
 cache_off() {
   echo "$1 Remote cache is off for this run."
   echo "CI cache mode: off"
@@ -203,8 +219,8 @@ fi
 
 # Starts the gateway in the background and sets gateway_server to its origin.
 # It gets no token: the environment loses the read token and the OIDC request
-# token, and it forwards the Authorization header Nx sends. In read mode it
-# answers cache writes itself, since the read token may not write.
+# token, and it forwards the Authorization header the tool sends. In read mode
+# it answers cache writes itself, since the read token may not write.
 start_gateway() {
   local dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
   local port_file="$dir/ci-cache-gateway.port"
@@ -242,10 +258,25 @@ start_gateway() {
 gateway_server=""
 start_gateway
 
-{
-  echo "NX_SELF_HOSTED_REMOTE_CACHE_SERVER=$gateway_server"
-  echo "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=$token"
-} >>"$GITHUB_ENV"
+if [[ "$tool" == turbo ]]; then
+  {
+    echo "TURBO_API=$gateway_server"
+    echo "TURBO_TOKEN=$token"
+    echo "TURBO_TEAM=$team"
+    echo "TURBO_RUN_SUMMARY=true"
+    # Read mode: Turbo never tries a PUT. TURBO_REMOTE_CACHE_READ_ONLY is
+    # deprecated and Turbo refuses to run with both set.
+    [[ "$mode" == write* ]] || echo "TURBO_CACHE=local:rw,remote:r"
+  } >>"$GITHUB_ENV"
+  # Empty; its mtime is when the run started. The post step reads the run
+  # summaries written after it.
+  : >"${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ci-cache-turbo-since"
+else
+  {
+    echo "NX_SELF_HOSTED_REMOTE_CACHE_SERVER=$gateway_server"
+    echo "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=$token"
+  } >>"$GITHUB_ENV"
+fi
 
 echo "CI cache mode: $mode"
 if [[ "$mode" == write* ]]; then

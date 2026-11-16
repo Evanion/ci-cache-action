@@ -17,6 +17,7 @@ const result = spawnSync('bash', [join(actionDir, 'setup.sh')], {
     // \`node\` on PATH may not exist before a setup-node step.
     CI_CACHE_NODE: process.execPath,
     INPUT_TOOL: input('tool'),
+    INPUT_TEAM: input('team'),
     INPUT_SERVER: input('server'),
     INPUT_READ_TOKEN: input('read-token'),
     INPUT_LARGE_UPLOAD_THRESHOLD: input('large-upload-threshold'),
